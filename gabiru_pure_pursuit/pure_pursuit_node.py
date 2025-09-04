@@ -1,234 +1,120 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import String
 from nav_msgs.msg import Odometry
-from gabiru_shared.csv_utils import load_csv, get_shared_data_path
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseArray, Twist
+from std_srvs.srv import Trigger
 import numpy as np
-import json
-import math
-import os
 import csv
-import time
+import os
 
 class PurePursuitNode(Node):
     def __init__(self):
         super().__init__('pure_pursuit_node')
-
-        # Parámetros del nodo
-        self.declare_parameter('wheelbase', 0.3)  # Distancia entre ejes del vehículo (en metros)
+        # Parámetros por defecto (se sobrescriben con el CSV)
+        self.declare_parameter('wheelbase', 0.16)  # TurtleBot3 Burger wheelbase
         self.wheelbase = self.get_parameter('wheelbase').value
-        self.csv_params_path = get_shared_data_path('optimized_PP_parms.csv')
-        self.csv_commands_path = get_shared_data_path('control_commands.csv')
-
-        # QoS para suscripciones y publicaciones
-        qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_ALL,
-            depth=1000
-        )
-
         # Suscripciones
-        self.segments_sub = self.create_subscription(
-            String,
-            'gabiru/segments',
-            self.segments_callback,
-            qos)
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            qos)
+        self.subscription_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.subscription_path = self.create_subscription(PoseArray, '/optimal_path', self.path_callback, 10)
+        # Publicador
+        self.publisher_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Servicio para sincronización
+        self.srv = self.create_service(Trigger, 'ready_to_pursue', self.ready_callback)
+        # Estado
+        self.current_pos = np.array([0.0, 0.0])  # [x, y]
+        self.current_theta = 0.0
+        self.waypoints = None  # Array de [x, y]
+        self.segments_params = {}  # Dict de params por segment_id
+        self.current_segment_id = 0
+        # Cargar parámetros del CSV
+        self.csv_path = os.path.expanduser("~/sim_ws/optimized_PP_params.csv")
+        self.load_params_from_csv()
+        # Timer para control
+        self.timer = self.create_timer(0.05, self.control_callback)  # 20 Hz
+        self.get_logger().info("PurePursuitNode iniciado, esperando /optimal_path...")
 
-        # Publicación de comandos de control
-        self.cmd_pub = self.create_publisher(String, 'gabiru/control_commands', qos)
-
-        #Publicacion de los comandos de velocidad para RViz
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', qos)
-
-        # Almacenamiento de datos
-        self.segments = {}  # Diccionario para almacenar waypoints por segment_id
-        self.params = {}    # Diccionario para almacenar parámetros optimizados por segment_id
-        self.current_pose = None  # Posición actual del vehículo
-        self.current_segment_id = 0  # Segmento actual
-        self.all_segments_optimized = False  # Bandera para verificar optimización completa
-
-        # Temporizador para verificar parámetros optimizados
-        self.timer = self.create_timer(1.0, self.check_optimization_status)
-
-    def check_optimization_status(self):
-        """Verifica si todos los segmentos están optimizados en el CSV."""
-        if self.all_segments_optimized:
+    def load_params_from_csv(self):
+        """Carga parámetros optimizados desde el CSV."""
+        if not os.path.isfile(self.csv_path):
+            self.get_logger().error(f"CSV no encontrado en {self.csv_path}")
             return
+        with open(self.csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                seg_id = int(row['segment_id'])
+                self.segments_params[seg_id] = {
+                    'Ld': float(row['Ld']),
+                    'vd': float(row['vd']),
+                    'w_max': float(row['w_max']),
+                    'start_idx': int(row['start_idx']),
+                    'end_idx': int(row['end_idx'])
+                }
+        self.get_logger().info(f"Cargados params para {len(self.segments_params)} tramos")
 
-        if not os.path.exists(self.csv_params_path):
-            self.get_logger().info("Esperando archivo CSV con parámetros optimizados...")
-            return
-
-        try:
-            df = load_csv('optimized_PP_parms.csv')
-            optimized_segment_ids = set(df['segment_id'].values)
-            received_segment_ids = set(self.segments.keys())
-
-            if received_segment_ids and optimized_segment_ids == received_segment_ids:
-                self.get_logger().info("Todos los segmentos están optimizados. Iniciando Pure Pursuit.")
-                self.all_segments_optimized = True
-                # Cargar parámetros desde CSV
-                for _, row in df.iterrows():
-                    segment_id = int(row['segment_id'])
-                    self.params[segment_id] = {
-                        'Ld': float(row['Ld']),
-                        'vd': float(row['vd']),
-                        'w_max': float(row['w_max'])
-                    }
-            else:
-                self.get_logger().info(f"Esperando optimización completa. Recibidos: {len(received_segment_ids)}, Optimizados: {len(optimized_segment_ids)}")
-        except Exception as e:
-            self.get_logger().error(f"Error al leer CSV: {e}")
-
-    def segments_callback(self, msg):
-        """Callback para almacenar los waypoints de los segmentos."""
-        try:
-            data = json.loads(msg.data)
-            segment_id = data["segment_id"]
-            waypoints = np.array(data["waypoints"])  # Convertir a numpy array
-            self.segments[segment_id] = {
-                "tipo": data["tipo"],
-                "waypoints": waypoints
-            }
-            self.get_logger().info(f"Recibido segmento {segment_id} con {len(waypoints)} waypoints")
-        except Exception as e:
-            self.get_logger().error(f"Error al parsear segmento: {e}")
+    def ready_callback(self, request, response):
+        """Responde al servicio ready_to_pursue."""
+        response.success = True
+        response.message = "PurePursuit listo para recibir waypoints"
+        self.get_logger().info("Servicio ready_to_pursue activado")
+        return response
 
     def odom_callback(self, msg):
-        """Callback para actualizar la posición actual del vehículo."""
-        self.current_pose = msg.pose.pose
-        if self.all_segments_optimized:
-            self.compute_pure_pursuit()
+        """Actualiza la posición y orientación del vehículo desde /odom."""
+        self.current_pos = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y])
+        self.current_theta = 2 * np.arctan2(msg.pose.pose.orientation.z, msg.pose.pose.orientation.w)  # Quaternion a yaw
 
-    def save_control_commands(self, segment_id, v, w):
-        """Guarda los comandos de control en un CSV."""
-        file_exists = os.path.isfile(self.csv_commands_path)
-        with open(self.csv_commands_path, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            if not file_exists:
-                writer.writerow(["timestamp", "segment_id", "v", "w"])
-            writer.writerow([time.time(), segment_id, v, w])
+    def path_callback(self, msg):
+        """Almacena waypoints de /optimal_path."""
+        self.waypoints = np.array([[pose.position.x, pose.position.y] for pose in msg.poses])
+        self.get_logger().info(f"Recibidos {len(self.waypoints)} waypoints en /optimal_path")
 
-    def compute_pure_pursuit(self):
-        """Calcula el ángulo de giro y la velocidad usando Pure Pursuit."""
-        if self.current_pose is None or not self.segments or not self.params:
-            self.get_logger().warn("Datos insuficientes (pose, segmentos o parámetros no disponibles)")
+    def control_callback(self):
+        """Implementa Pure Pursuit y publica /cmd_vel."""
+        if self.waypoints is None or not self.segments_params:
             return
-
-        # Obtener waypoints y parámetros del segmento actual
-        if self.current_segment_id not in self.segments or self.current_segment_id not in self.params:
-            self.get_logger().warn(f"Segmento {self.current_segment_id} no disponible")
+        # Encontrar waypoint más cercano
+        distances = np.linalg.norm(self.waypoints - self.current_pos, axis=1)
+        nearest_idx = np.argmin(distances)
+        # Determinar tramo actual basado en índice
+        for seg_id, params in self.segments_params.items():
+            if params['start_idx'] <= nearest_idx <= params['end_idx']:
+                self.current_segment_id = seg_id
+                break
+        else:
+            self.get_logger().warn(f"No se encontró tramo para índice {nearest_idx}")
             return
-
-        waypoints = self.segments[self.current_segment_id]["waypoints"]
-        params = self.params[self.current_segment_id]
-        Ld = params["Ld"]  # Lookahead distance
-        vd = params["vd"]  # Velocidad deseada
-        w_max = params["w_max"]  # Velocidad angular máxima
-
-        # Posición y orientación actual del vehículo
-        x = self.current_pose.position.x
-        y = self.current_pose.position.y
-        quaternion = (
-            self.current_pose.orientation.x,
-            self.current_pose.orientation.y,
-            self.current_pose.orientation.z,
-            self.current_pose.orientation.w
-        )
-        # Convertir quaternion a yaw (en radianes)
-        yaw = self.quaternion_to_yaw(quaternion)
-
-        # Encontrar el waypoint objetivo (el más cercano dentro de Ld)
-        target_wp = self.find_target_waypoint(waypoints, x, y, Ld)
-
-        if target_wp is None:
-            self.get_logger().warn("No se encontró un waypoint objetivo")
-            return
-
-        # Calcular el ángulo de giro usando Pure Pursuit
-        steering_angle = self.calculate_steering_angle(x, y, yaw, target_wp, Ld)
-
-        # Limitar la velocidad angular
-        steering_angle = np.clip(steering_angle, -w_max, w_max)
-
-        # Publicar comando de control
-        cmd = String()
-        cmd_data = {
-            "timestamp": time.time(),
-            "segment_id": self.current_segment_id,
-            "v": vd,
-            "w": steering_angle
-        }
-        cmd.data = json.dumps(cmd_data)
-        self.cmd_pub.publish(cmd)
-        self.get_logger().info(f"Comando publicado para segmento {self.current_segment_id}: {cmd.data}")
-
-
-        #Publicar velocidad y direccion para RViz       
+        # Obtener parámetros del tramo actual
+        params = self.segments_params[self.current_segment_id]
+        Ld = params['Ld']
+        vd = min(params['vd'], 0.22)  # Limitar para TurtleBot3 Burger
+        w_max = min(params['w_max'], 2.84)  # Limitar para TurtleBot3 Burger
+        # Calcular look-ahead point
+        look_ahead_idx = nearest_idx
+        cum_dist = 0.0
+        while look_ahead_idx < len(self.waypoints) - 1 and cum_dist < Ld:
+            cum_dist += np.linalg.norm(self.waypoints[look_ahead_idx + 1] - self.waypoints[look_ahead_idx])
+            look_ahead_idx += 1
+        if look_ahead_idx >= len(self.waypoints):
+            look_ahead_idx = len(self.waypoints) - 1
+        goal_point = self.waypoints[look_ahead_idx]
+        # Calcular ángulo relativo (alpha)
+        alpha = np.arctan2(goal_point[1] - self.current_pos[1], goal_point[0] - self.current_pos[0]) - self.current_theta
+        # Calcular curvatura y velocidad angular
+        kappa = 2 * np.sin(alpha) / Ld
+        w = vd * kappa
+        # Limitar velocidad angular
+        if abs(w) > w_max:
+            w = np.sign(w) * w_max
+        # Publicar comando
         cmd = Twist()
-        cmd.linear.x = vd  # Velocidad lineal en el eje x
-        cmd.angular.z = steering_angle  # Velocidad angular en el eje z (yaw)
-        self.cmd_pub.publish(cmd)
-        self.get_logger().info(f"Comando publicado para segmento {self.current_segment_id}: v={vd}, w={steering_angle}")
-
-        # Guardar comando en CSV
-        self.save_control_commands(self.current_segment_id, vd, steering_angle)
-
-    def find_target_waypoint(self, waypoints, x, y, Ld):
-        """Encuentra el waypoint objetivo más cercano dentro de la distancia Ld."""
-        min_dist = float('inf')
-        target_wp = None
-
-        for wp in waypoints:
-            dist = np.sqrt((wp[0] - x)**2 + (wp[1] - y)**2)
-            if dist <= Ld and dist < min_dist:
-                min_dist = dist
-                target_wp = wp
-
-        return target_wp
-
-    def calculate_steering_angle(self, x, y, yaw, target_wp, Ld):
-        """Calcula el ángulo de giro usando el algoritmo Pure Pursuit."""
-        # Coordenadas del waypoint objetivo
-        target_x, target_y = target_wp[0], target_wp[1]
-
-        # Transformar el waypoint objetivo al sistema de coordenadas del vehículo
-        dx = target_x - x
-        dy = target_y - y
-        alpha = math.atan2(dy, dx) - yaw
-        alpha = self.normalize_angle(alpha)
-
-        # Calcular el ángulo de giro
-        steering_angle = math.atan2(2.0 * self.wheelbase * math.sin(alpha), Ld)
-        return steering_angle
-
-    def normalize_angle(self, angle):
-        """Normaliza un ángulo al rango [-pi, pi]."""
-        while angle > math.pi:
-            angle -= 2.0 * math.pi
-        while angle < -math.pi:
-            angle += 2.0 * math.pi
-        return angle
-
-    def quaternion_to_yaw(self, quaternion):
-        """Convierte un quaternion a ángulo yaw."""
-        x, y, z, w = quaternion
-        siny_cosp = 2.0 * (w * z + x * y)
-        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        return yaw
+        cmd.linear.x = vd
+        cmd.angular.z = w
+        self.publisher_cmd.publish(cmd)
+        self.get_logger().info(f"Tramo {self.current_segment_id}: Ld={Ld:.2f}, vd={vd:.2f}, w={w:.2f}")
 
 def main(args=None):
     rclpy.init(args=args)
     node = PurePursuitNode()
-    node.get_logger().info("Nodo Pure Pursuit iniciado")
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
