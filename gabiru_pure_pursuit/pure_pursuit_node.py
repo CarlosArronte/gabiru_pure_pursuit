@@ -14,12 +14,16 @@ class PurePursuitNode(Node):
         self.declare_parameter('wheelbase', 0.16)  # TurtleBot3 Burger wheelbase
         self.wheelbase = self.get_parameter('wheelbase').value
         # Suscripciones
+
+        #Nota: En el programa en general solo falta que esta Odometry funcione en conjunto con Gazebo,rviz, nav2 etc
+        #Como esta el programa ahora mismo, se publica el primer segmento y, como Odometry no cambia, nos quedamos publicando este segmento.
         self.subscription_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.subscription_path = self.create_subscription(PoseArray, '/optimal_path', self.path_callback, 10)
         # Publicador
         self.publisher_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
         # Servicio para sincronización
         self.srv = self.create_service(Trigger, 'ready_to_pursue', self.ready_callback)
+        self.srv_online = self.create_service(Trigger,'ready_to_receive_path',self.ready_callback)#Para poderme comunicar con el best_path en el online
         # Estado
         self.current_pos = np.array([0.0, 0.0])  # [x, y]
         self.current_theta = 0.0
